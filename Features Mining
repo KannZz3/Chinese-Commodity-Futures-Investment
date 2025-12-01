@@ -1,1 +1,1129 @@
+import sys
+print("当前解释器：", sys.executable)
+
+# 安装 / 升级 akshare 和 xgboost
+!{sys.executable} -m pip install -U akshare xgboost -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import akshare as ak
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
+from sklearn.model_selection import TimeSeriesSplit
+
+# ========= PyTorch 部分 =========
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Sampler
+from torch.cuda.amp import autocast, GradScaler
+
+# =========================
+# 0. 参数设置
+# =========================
+symbol = "RB0"       
+period = "daily"  
+
+H = 3                # 未来 3 根 K 线
+TH = 0.01           # 阈值：0.8%（如果想用 4%，改成 0.04）
+N_TOP_IMPORTANCE = 10   # 通过 permutation importance 保留的 TopN 特征
+N_GROUP = 5          # 分层回测时的分组数量（分为 5 组）
+SEQ_LEN = 60         # LSTM 序列长度（用过去 32 根 K 线）
+BATCH_SIZE = 64
+EPOCHS = 20
+LR = 1e-3
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# =========================
+# 正确获取主连日 K 数据
+# =========================
+df_raw = ak.futures_main_sina(symbol="RB0")
+
+# akshare 返回的是中文字段，需要重命名
+df_raw.rename(columns={
+    "日期": "datetime",
+    "开盘价": "open",
+    "最高价": "high",
+    "最低价": "low",
+    "收盘价": "close",
+    "成交量": "volume",
+    "持仓量": "hold",
+    # "动态结算价": "settle"  # 如果你需要的话
+}, inplace=True)
+
+data = df_raw.copy()
+
+# =========================
+# 2. 时间处理
+# =========================
+data["datetime"] = pd.to_datetime(data["datetime"])
+data.set_index("datetime", inplace=True)
+data.sort_index(inplace=True)
+data = data[["open", "high", "low", "close","volume","hold"]].copy()
+print(data.tail())
+
+# =========================
+# 3. 基础特征：单根收益 & K 线形态
+# =========================
+# 单根收益
+data["ret_1"] = data["close"].pct_change()
+
+# K线形态相关：实体、范围、上下影线
+data["body"] = data["close"] - data["open"]
+data["range"] = data["high"] - data["low"]
+data["upper_shadow"] = data["high"] - data[["open", "close"]].max(axis=1)
+data["lower_shadow"] = data[["open", "close"]].min(axis=1) - data["low"]
+
+# 占比（归一化）
+data["body_pct"] = data["body"] / data["range"].replace(0, np.nan)
+data["upper_shadow_pct"] = data["upper_shadow"] / data["range"].replace(0, np.nan)
+data["lower_shadow_pct"] = data["lower_shadow"] / data["range"].replace(0, np.nan)
+
+data["is_bull"] = (data["close"] > data["open"]).astype(int)
+data["is_bear"] = (data["close"] < data["open"]).astype(int)
+
+# =========================
+# 4. 动量 & 波动率 & 均线因子
+# =========================
+# 动量：过去 n 根 30min 的涨跌
+for n in [2, 4, 8, 16]:
+    data[f"mom_{n}"] = data["close"].pct_change(n)
+
+# 波动率：过去 n 根的收益率 std
+for n in [4, 8, 16]:
+    data[f"vol_{n}"] = data["ret_1"].rolling(n).std()
+
+# 均线 & 乖离
+for n in [4, 8, 16, 32]:
+    data[f"ma_{n}"] = data["close"].rolling(n).mean()
+    data[f"close_ma_{n}"] = data["close"] / data[f"ma_{n}"] - 1
+# =========================
+# 5.成交量 & 持仓量 相关因子
+# =========================
+
+# 1. Volume returns
+data["vol_ret_1"] = data["volume"].pct_change()
+data["vol_ret_5"] = data["volume"].pct_change(5)
+data["vol_ret_10"] = data["volume"].pct_change(10)
+
+# 2. Volume MA & bias
+for n in [5, 10, 20]:
+    data[f"vol_ma_{n}"] = data["volume"].rolling(n).mean()
+    data[f"vol_ma_bias_{n}"] = data["volume"] / data[f"vol_ma_{n}"] - 1
+
+# 3. Volume volatility
+for n in [5, 10, 20]:
+    data[f"vol_vol_{n}"] = data["volume"].pct_change().rolling(n).std()
+
+# 4. Volume-Price divergence
+data["vol_price_div_1"] = data["volume"].pct_change() - data["close"].pct_change()
+data["vol_price_div_5"] = data["volume"].pct_change(5) - data["close"].pct_change(5)
+
+# 1. Hold returns
+data["hold_ret_1"] = data["hold"].pct_change()
+data["hold_ret_5"] = data["hold"].pct_change(5)
+data["hold_ret_10"] = data["hold"].pct_change(10)
+
+# 2. Hold MA & bias
+for n in [5, 10, 20]:
+    data[f"hold_ma_{n}"] = data["hold"].rolling(n).mean()
+    data[f"hold_ma_bias_{n}"] = data["hold"] / data[f"hold_ma_{n}"] - 1
+
+# 3. Hold volatility
+for n in [5, 10, 20]:
+    data[f"hold_vol_{n}"] = data["hold"].pct_change().rolling(n).std()
+
+# 4. Price–OI divergence
+data["price_oi_div_1"] = data["close"].pct_change() - data["hold"].pct_change()
+data["price_oi_div_5"] = data["close"].pct_change(5) - data["hold"].pct_change(5)
+
+# 5. Volume / Hold ratio
+data["volume_hold_ratio"] = data["volume"] / (data["hold"] + 1e-6)
+
+# 6. Volume–Price correlation
+data["vp_ratio"] = (
+    data["volume"].pct_change().rolling(5).corr(data["close"].pct_change())
+)
+
+# =========================
+# 6. 缺失值处理
+# =========================
+print("各列缺失值数量：")
+print(data.isna().sum())
+
+nan_rows = data.isna().any(axis=1).sum()
+print("\n至少有一个 NaN 的行数：", nan_rows)
+
+data = data.dropna().copy()
+print("\n去除 NaN 后数据量：", data.shape)
+
+# =========================
+# 7. 构造标签：未来 H 根累计收益 & 大涨 / 大跌事件
+# =========================
+# 未来 H 根累计收益（相对当前 close）
+data["future_ret_H"] = data["close"].shift(-H) / data["close"] - 1
+
+# 未来大涨 ≥ +TH
+data["y_up"] = (data["future_ret_H"] >= TH).astype(int)
+
+# 未来大跌 ≤ -TH
+data["y_down"] = (data["future_ret_H"] <= -TH).astype(int)
+
+# 最后 H 行未来收益为空，丢掉
+data = data.dropna().copy()
+
+print("y_up=1（未来大涨≥阈值）样本占比：", data["y_up"].mean())
+print("y_down=1（未来大跌≤-阈值）样本占比：", data["y_down"].mean())
+
+# ============================================
+# 8. 因子处理（重尾修正 + 标准化）
+# ============================================
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from scipy.stats import kurtosis
+
+class FeaturePreprocessor:
+    def __init__(self,
+                 heavy_kurtosis=6,
+                 clip_pct=(1, 99),
+                 log_candidates=('volume', 'hold'),
+                 robust=False):
+
+        self.heavy_kurtosis = heavy_kurtosis
+        self.clip_low, self.clip_high = clip_pct
+        self.log_candidates = log_candidates
+        self.use_robust = robust
+
+        self.feature_cols = None
+        self.heavy_cols = []
+        self.clip_bounds = {}
+        self.scaler = None
+
+    def _detect_heavy(self, df):
+        return [
+            c for c in self.feature_cols
+            if kurtosis(df[c], fisher=False) > self.heavy_kurtosis
+        ]
+
+    def _process_col(self, x, col, fit):
+        if fit:
+            lo, hi = np.percentile(x, [self.clip_low, self.clip_high])
+            self.clip_bounds[col] = (lo, hi)
+        else:
+            lo, hi = self.clip_bounds[col]
+
+        x = np.clip(x, lo, hi)
+        return np.sign(x) * np.log1p(np.abs(x))
+
+    def fit(self, df, feature_cols):
+        self.feature_cols = feature_cols
+
+        auto_heavy = self._detect_heavy(df)
+        manual = [c for c in self.log_candidates if c in feature_cols]
+        self.heavy_cols = sorted(set(auto_heavy + manual))
+
+        df_proc = df.copy()
+        for col in self.heavy_cols:
+            df_proc[col] = self._process_col(df_proc[col].values, col, fit=True)
+
+        self.scaler = RobustScaler() if self.use_robust else StandardScaler()
+        self.scaler.fit(df_proc[self.feature_cols])
+        return self
+
+    def transform(self, df):
+        df2 = df.copy()
+        for col in self.heavy_cols:
+            df2[col] = self._process_col(df2[col].values, col, fit=False)
+        df2[self.feature_cols] = self.scaler.transform(df2[self.feature_cols])
+        return df2
+
+    def report(self, df):
+        stats = df[self.feature_cols].describe().T
+        print(stats[['mean', 'std', 'min', 'max']])
+        print("\nMax abs:", df[self.feature_cols].abs().max().max())
+
+# ============================================
+# 9. Train/Test 时间切分（不泄漏）
+# ============================================
+
+# 保存未缩放的原始数据用于分层回测
+data_raw_for_backtest = data.copy()
+
+# 标签列
+exclude_cols = ["future_ret_H", "y_up", "y_down"]
+
+# 特征列表（排序，保持一致）
+feature_cols = sorted([c for c in data.columns if c not in exclude_cols])
+
+# 8. 按时间切分
+n = len(data)
+train_end = int(n * 0.85)
+
+train_all = data.iloc[:train_end].copy()
+test = data.iloc[train_end:].copy()
+
+print("Train samples:", len(train_all), "Test samples:", len(test))
+
+# ============================================
+# 10. 特征预处理：fit(train) + transform(train/test)
+# ============================================
+
+prep = FeaturePreprocessor()
+
+# 只用训练集 fit（不会泄漏未来信息）
+prep.fit(train_all, feature_cols)
+
+# transform train + test
+train_all_scaled = prep.transform(train_all)
+test_scaled = prep.transform(test)
+
+# 预处理报告（均匀分布、方差=1）
+print("\n=== Preprocessing Report (Training Set) ===")
+prep.report(train_all_scaled)
+
+# ============================================
+# 11. 分层回测（必须使用原始数据 data_raw_for_backtest）
+# ============================================
+
+def factor_group_demo(df, factor_cols, future_col="future_ret_H", n_group=5, dataset_name="test"):
+    print(f"\n========== {dataset_name}: 分层回测（{n_group} 组） ==========")
+    for fac in factor_cols:
+        sub = df[[fac, future_col]].dropna()
+        if len(sub) == 0:
+            print(f"{fac}: 无数据，跳过")
+            continue
+        try:
+            sub["group"] = pd.qcut(sub[fac], n_group, labels=False, duplicates="drop")
+        except ValueError:
+            print(f"{fac}: qcut 失败，跳过")
+            continue
+        print(f"\n{fac} 分层结果：")
+        print(sub.groupby("group")[future_col].agg(["count", "mean"]))
+# =========================
+# 12. 序列数据构造函数：从表格 → [N, T, F]
+# =========================
+def build_sequence_data(df, feature_cols, target_col, seq_len=32):
+    """
+    将时间序列 DataFrame 转换为 LSTM 可用的序列张量。
+    
+    参数：
+    df: 已按时间排序的 DataFrame
+    feature_cols: 输入特征列列表
+    target_col: 标签列
+    seq_len: 每个样本使用的时间长度
+
+    返回：
+    X: [N, seq_len, F] 的 float32 numpy 数组
+    y: [N] 的 float32 numpy 数组
+    idx_list: 每个样本对应原 df 的时间索引
+    """
+
+    # ------------------------------
+    # 1) 安全检查
+    # ------------------------------
+    missing = [c for c in feature_cols if c not in df.columns]
+    assert len(missing) == 0, f"Missing features in df: {missing}"
+
+    # 取值矩阵，确保 float32
+    values = df[feature_cols].to_numpy(dtype=np.float32)
+    y = df[target_col].to_numpy(dtype=np.float32).ravel()
+    index = df.index
+
+    # NA 检查（LSTM 不能处理 NaN）
+    if np.isnan(values).any():
+        raise ValueError("NaN found in feature matrix before sequence building.")
+
+    # ------------------------------
+    # 2) 构造序列
+    # ------------------------------
+    X_list, y_list, idx_list = [], [], []
+
+    for t in range(seq_len - 1, len(df)):
+        X_seq = values[t-seq_len+1 : t+1]          # [seq_len, F]
+        y_t = y[t]
+
+        X_list.append(X_seq)
+        y_list.append(y_t)
+        idx_list.append(index[t])
+
+    # ------------------------------
+    # 3) 转为 numpy 数组
+    # ------------------------------
+    X_arr = np.stack(X_list).astype(np.float32)    # [N, seq_len, F]
+    y_arr = np.array(y_list, dtype=np.float32)     # [N]
+
+    return X_arr, y_arr, idx_list
+
+X_train, y_train, idx_train = build_sequence_data(
+    train_all, feature_cols, target_col="y_up", seq_len=32
+)
+
+print("\n===== Sequence Data Check =====")
+print("X_train shape:", X_train.shape)
+print("y_train shape:", y_train.shape)
+print("First index:", idx_train[0])
+print("First label:", y_train[0])
+print("First sample X shape:", X_train[0].shape)
+print("First sample X (first 5 timesteps):\n", X_train[0][:5])
+print("====================================\n")
+
+# =========================
+# 13. PyTorch Dataset 封装
+# =========================
+class SeqDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = X.astype(np.float32)
+        self.y = y.astype(np.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# =========================
+# 14. lstm
+# =========================
+class LSTMClassifier(nn.Module):
+    def __init__(self, num_features, hidden_size=64, num_layers=1, dropout=0.3):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        out, (h_n, c_n) = self.lstm(x)
+        h_last = h_n[-1]          # [B, H]
+        h_last = self.norm(h_last)
+        h_last = self.dropout(h_last)
+        logits = self.fc(h_last)
+        return logits.squeeze(-1)
+
+
+# ============================================
+# ⭐ BlockShuffleSampler：时间块打乱采样器
+#   - 保留序列内部顺序
+#   - 不同时间段的 block 顺序打乱，防止过拟合某一时期
+# ============================================
+class BlockShuffleSampler(Sampler):
+    def __init__(self, data_len, block_size=256):
+        """
+        data_len: 数据集长度
+        block_size: 每个时间块的大小（样本数）
+        """
+        self.data_len = data_len
+        self.block_size = block_size
+
+    def __iter__(self):
+        # 所有下标
+        indices = np.arange(self.data_len)
+        # 切成若干个 block
+        blocks = [
+            indices[i : i + self.block_size]
+            for i in range(0, self.data_len, self.block_size)
+        ]
+        # 打乱 block 顺序
+        np.random.shuffle(blocks)
+        # 再拼回一维数组
+        shuffled = np.concatenate(blocks)
+        return iter(shuffled.tolist())
+
+    def __len__(self):
+        return self.data_len
+
+
+# ============================================
+# ⭐ Precision@k 工具函数
+#   k 可以是比例（0<k<1），例如 0.01 → top 1%
+# ============================================
+def precision_at_k(y_true, y_prob, k):
+    """
+    y_true: 0/1 numpy array
+    y_prob: 预测概率 numpy array
+    k: 若 0<k<1 → 按比例选；若 k>=1 → 按样本个数选
+    """
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+
+    n = len(y_true)
+    if n == 0:
+        return np.nan
+
+    if 0 < k < 1:
+        k_int = max(1, int(n * k))
+    else:
+        k_int = int(k)
+
+    k_int = min(k_int, n)
+    if k_int <= 0:
+        return np.nan
+
+    idx = np.argsort(-y_prob)  # 概率从大到小排序
+    top_idx = idx[:k_int]
+    return y_true[top_idx].mean()
+
+
+# ============================================
+# ⭐ 全新版 train_lstm_model（集成所有优化）
+# ============================================
+def train_lstm_model(
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    num_features,
+    n_epochs=EPOCHS,
+    lr=LR,
+    batch_size=BATCH_SIZE,
+    block_size=256,
+    patience_es=5,          # Early Stopping 容忍 epoch 数
+    patience_lr=2,          # LR scheduler 容忍 epoch 数
+    topk_list=(0.01, 0.05), # Precision@k, 比例形式
+    use_amp=True,           # 是否使用混合精度
+    device=device,
+):
+    """
+    基于之前代码的升级版训练函数：
+      - BlockShuffleSampler（时间块级打乱）
+      - Early Stopping（按 val_auc）
+      - ReduceLROnPlateau（按 val_auc 调 LR）
+      - Mixed precision（AMP）
+      - Precision@k 指标
+      - 保存 val_auc 最佳模型
+    """
+    # ========= Dataset & DataLoader =========
+    train_dataset = SeqDataset(X_train, y_train)
+    val_dataset = SeqDataset(X_val, y_val)
+
+    train_sampler = BlockShuffleSampler(len(train_dataset), block_size=block_size)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    # ========= 模型 =========
+    # 假设你的 LSTMClassifier 内部已经支持 dropout / LayerNorm 等
+    model = LSTMClassifier(num_features=num_features).to(device)
+
+    # ========= 类别不平衡：pos_weight =========
+    pos = float(y_train.sum())
+    neg = float(len(y_train) - pos)
+    if pos == 0:
+        pos_weight = torch.tensor(1.0, device=device)
+    else:
+        pos_weight = torch.tensor(neg / max(pos, 1.0), device=device)
+    print("  BCE pos_weight =", float(pos_weight))
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",        # 以 val_auc 为“越大越好”
+        factor=0.5,
+        patience=patience_lr,
+        verbose=True,
+        min_lr=1e-6,
+    )
+
+    scaler = GradScaler(enabled=use_amp)
+
+    # ========= Early Stopping & best model =========
+    best_auc = -np.inf
+    best_state_dict = None
+    best_epoch = -1
+    es_counter = 0  # 连续没有提升的 epoch 数
+
+    for epoch in range(1, n_epochs + 1):
+        # -----------------------
+        # 1) Train
+        # -----------------------
+        model.train()
+        total_loss = 0.0
+        n_train = 0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            optimizer.zero_grad()
+
+            with autocast(enabled=use_amp):
+                logits = model(xb)           # [B]
+                loss = criterion(logits, yb) # scalar
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            bs = xb.size(0)
+            total_loss += loss.item() * bs
+            n_train += bs
+
+        avg_train_loss = total_loss / max(n_train, 1)
+
+        # -----------------------
+        # 2) Validation
+        # -----------------------
+        model.eval()
+        val_probs_list = []
+        val_trues_list = []
+        val_loss_total = 0.0
+        n_val = 0
+
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                logits = model(xb)
+                loss_val = criterion(logits, yb)
+
+                prob = torch.sigmoid(logits)
+
+                bs = xb.size(0)
+                val_loss_total += loss_val.item() * bs
+                n_val += bs
+
+                val_probs_list.append(prob.cpu().numpy())
+                val_trues_list.append(yb.cpu().numpy())
+
+        val_probs = np.concatenate(val_probs_list) if len(val_probs_list) > 0 else np.array([])
+        val_trues = np.concatenate(val_trues_list) if len(val_trues_list) > 0 else np.array([])
+
+        avg_val_loss = val_loss_total / max(n_val, 1)
+
+        # ---- 计算指标 ----
+        if len(val_trues) > 0:
+            val_pred = (val_probs > 0.5).astype(int)
+            val_acc = accuracy_score(val_trues, val_pred)
+
+            if len(np.unique(val_trues)) > 1:
+                val_auc = roc_auc_score(val_trues, val_probs)
+            else:
+                val_auc = 0.5  # 单一类别时，AUC 视作随机
+        else:
+            val_acc, val_auc = np.nan, np.nan
+
+        # Precision@k
+        prec_at_k_dict = {}
+        for k in topk_list:
+            prec_at_k_dict[k] = precision_at_k(val_trues, val_probs, k) if len(val_trues) > 0 else np.nan
+
+        # ---- 学习率调度（基于 val_auc）----
+        scheduler.step(val_auc if np.isfinite(val_auc) else 0.5)
+
+        # ---- Early Stopping & 保存最佳模型 ----
+        improved = val_auc > best_auc + 1e-4  # 可以设个极小阈值避免浮点抖动
+        if improved:
+            best_auc = val_auc
+            best_epoch = epoch
+            es_counter = 0
+            best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            es_counter += 1
+
+        # ---- 打印日志 ----
+        prec_str = " ".join(
+            [f"Prec@{int(k*100)}%={prec_at_k_dict[k]:.4f}" for k in topk_list]
+        )
+        print(
+            f"Epoch {epoch:02d}/{n_epochs} | "
+            f"train_loss={avg_train_loss:.4f} | "
+            f"val_loss={avg_val_loss:.4f} | "
+            f"val_acc={val_acc:.4f} | val_auc={val_auc:.4f} | "
+            f"{prec_str} | "
+            f"lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
+
+        # ---- Early Stopping 触发 ----
+        if es_counter >= patience_es:
+            print(f"Early stopping triggered at epoch {epoch} (best epoch = {best_epoch}, best AUC={best_auc:.4f})")
+            break
+
+    # ========= 恢复最佳模型参数 =========
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+        print(f"Loaded best model from epoch {best_epoch}, val_auc={best_auc:.4f}")
+    else:
+        print("Warning: best_state_dict is None, model is last-epoch state.")
+
+    return model
+
+
+# ============================================
+# 16. permutation
+# ============================================
+
+def permutation_importance_lstm(
+    model,
+    X_val,
+    y_val,
+    n_repeats=3,
+    random_state=42,
+    normalize=True,
+    device=device,
+):
+    """
+    优化后的 LSTM permutation importance：
+    - 仅使用验证集/测试集，不允许训练集参与
+    - 避免 repeated GPU 转换
+    - 更高效的 random shuffle
+    - 支持 normalized importance（便于排序）
+    """
+    assert len(X_val) == len(y_val), "X_val and y_val must match length!"
+    np.random.seed(random_state)
+
+    model.eval()
+
+    # -------------------------
+    # baseline prediction
+    # -------------------------
+    X_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
+    with torch.no_grad():
+        logits = model(X_tensor)
+        base_prob = torch.sigmoid(logits).cpu().numpy()
+
+    if len(np.unique(y_val)) > 1:
+        base_auc = roc_auc_score(y_val, base_prob)
+    else:
+        print("Warning: Only one class in validation set. AUC = NaN")
+        return np.zeros(X_val.shape[-1]), np.nan
+
+    num_features = X_val.shape[-1]
+    importances = np.zeros(num_features)
+
+    # -------------------------
+    # permutation importance
+    # -------------------------
+    for f in range(num_features):
+        auc_drops = []
+
+        for _ in range(n_repeats):
+            # 复制以便 shuffle 单个特征
+            X_perm = X_val.copy()
+            
+            # 打乱 feature f 所有时间步/所有样本
+            # flatten → shuffle → reshape（高效）
+            flat = X_perm[:, :, f].reshape(-1)
+            np.random.shuffle(flat)
+            X_perm[:, :, f] = flat.reshape(X_perm.shape[0], X_perm.shape[1])
+
+            # 推理
+            X_perm_t = torch.tensor(X_perm, dtype=torch.float32).to(device)
+            with torch.no_grad():
+                logits_perm = model(X_perm_t)
+                prob_perm = torch.sigmoid(logits_perm).cpu().numpy()
+
+            auc_perm = roc_auc_score(y_val, prob_perm)
+            auc_drops.append(base_auc - auc_perm)
+
+        importances[f] = np.mean(auc_drops)
+
+    # -------------------------
+    # 归一化 importance（可选）
+    # -------------------------
+    if normalize and importances.max() > 0:
+        importances = importances / importances.max()
+
+    return importances, base_auc
+
+    # ======================================================
+    # 17. train_one_direction_lstm
+    # ======================================================
+
+def train_one_direction_lstm(
+    train_df, 
+    test_df, 
+    feature_cols, 
+    target_col, 
+    direction_name="UP"
+):
+    print(f"\n========== 开始训练 {direction_name} (LSTM) 模型, target = {target_col} ==========\n")
+
+    # ======================================================
+    # ⭐ 1. 先拼接 train_df + test_df（只用于构造序列，不泄漏）
+    # ======================================================
+    full_df = pd.concat([train_df, test_df], axis=0)
+    full_df = full_df.sort_index()
+
+    # 用 build_sequence_data 在“全体数据”上构造序列
+    X_seq_all, y_seq_all, idx_all = build_sequence_data(
+        full_df, feature_cols, target_col, seq_len=SEQ_LEN
+    )
+
+    idx_all = np.array(idx_all)
+
+    # ======================================================
+    # ⭐ 2. 用日期过滤序列（避免窗口跨越 train/test）
+    # ======================================================
+    train_end_date = train_df.index[-1]
+
+    # 训练样本：序列末端日期 ≤ 训练集最后一天
+    train_mask = idx_all <= train_end_date
+    # 测试样本：序列末端日期 ≥ 测试集第一天（等价于：idx > train_end）
+    test_mask = idx_all > train_end_date
+
+    X_train_seq = X_seq_all[train_mask]
+    y_train_seq = y_seq_all[train_mask]
+    idx_train_seq = idx_all[train_mask]
+
+    X_test_seq = X_seq_all[test_mask]
+    y_test_seq = y_seq_all[test_mask]
+    idx_test_seq = idx_all[test_mask]
+
+    # ======================================================
+    # ⭐ 3. 在训练序列中切分 train / validation（无窗口重叠）
+    # ======================================================
+    n_train = len(X_train_seq)
+    val_start = int(n_train * 0.8)
+
+    X_tr = X_train_seq[:val_start]
+    y_tr = y_train_seq[:val_start]
+
+    X_val = X_train_seq[val_start:]
+    y_val = y_train_seq[val_start:]
+
+    num_features = X_train_seq.shape[-1]
+
+    print(f"{direction_name} 序列样本量： Train={len(X_train_seq)}, Test={len(X_test_seq)}")
+    print(f"{direction_name} 标签比例： Train={y_train_seq.mean():.4f}, Test={y_test_seq.mean():.4f}")
+
+    # ======================================================
+    # ⭐ 4. 训练（用你升级后的 train_lstm_model）
+    # ======================================================
+    model = train_lstm_model(
+        X_tr, y_tr,
+        X_val, y_val,
+        num_features=num_features,
+        n_epochs=EPOCHS,
+        lr=LR,
+        batch_size=BATCH_SIZE
+    )
+
+    # ======================================================
+    # ⭐ 5. 测试集评估（OOS）
+    # ======================================================
+    model.eval()
+    X_test_t = torch.tensor(X_test_seq, dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        logits_test = model(X_test_t)
+        prob_test = torch.sigmoid(logits_test).cpu().numpy()
+    pred_test = (prob_test > 0.5).astype(int)
+
+    acc_test = accuracy_score(y_test_seq, pred_test)
+    auc_test = (
+        roc_auc_score(y_test_seq, prob_test)
+        if len(np.unique(y_test_seq)) > 1 else np.nan
+    )
+
+    print(f"\n{direction_name} - Test ACC: {acc_test:.4f}")
+    print(f"{direction_name} - Test AUC: {auc_test:.4f}")
+    print(f"\n{direction_name} - Test classification_report:")
+    print(classification_report(y_test_seq, pred_test))
+
+    # ======================================================
+    # ⭐ 6. （最关键）Permutation Importance 必须基于验证集
+    # ======================================================
+    print(f"\n{direction_name} - 基于验证集计算 Permutation Importance ...")
+    importances, base_auc = permutation_importance_lstm(
+        model, X_val, y_val, n_repeats=3
+    )
+
+    importance_series = (
+        pd.Series(importances, index=feature_cols)
+        .sort_values(ascending=False)
+    )
+
+    print(f"\n{direction_name} - Permutation Importance (Top 20)：")
+    print(importance_series.head(20))
+
+    # Top N 特征
+    top_features = list(importance_series.head(N_TOP_IMPORTANCE).index)
+    print(f"\n{direction_name} 选取 Top{N_TOP_IMPORTANCE} 特征：", top_features)
+
+    # ======================================================
+    # ⭐ 7. 返回完整结果
+    # ======================================================
+    return {
+        "model": model,
+        "top_features": top_features,
+        "importance_series": importance_series,
+        "test_prob": prob_test,
+        "test_pred": pred_test,
+        "test_true": y_test_seq,
+        "test_index": idx_test_seq,
+        "base_auc": base_auc,
+    }
+
+# =========================
+# 18. 训练大涨 / 大跌 LSTM 模型
+# =========================
+up_result_lstm = train_one_direction_lstm(
+    train_df=train_all,
+    test_df=test,
+    feature_cols=feature_cols,
+    target_col="y_up",
+    direction_name="UP(大涨≥阈值)"
+)
+
+down_result_lstm = train_one_direction_lstm(
+    train_df=train_all,
+    test_df=test,
+    feature_cols=feature_cols,
+    target_col="y_down",
+    direction_name="DOWN(大跌≤-阈值)"
+)
+
+print("\n大涨模型 LSTM Top 特征：", up_result_lstm["top_features"])
+print("大跌模型 LSTM Top 特征：", down_result_lstm["top_features"])
+
+# =========================
+# 19. 对 LSTM 筛出来的 Top 因子做分层回测（看未来 3K 收益）
+#     注意：这里仍然用原来的 test DataFrame（非序列形式）
+# =========================
+factor_group_demo(test, up_result_lstm["top_features"], "future_ret_H",
+                  n_group=N_GROUP, dataset_name="Test (LSTM UP 模型因子)")
+
+factor_group_demo(test, down_result_lstm["top_features"], "future_ret_H",
+                  n_group=N_GROUP, dataset_name="Test (LSTM DOWN 模型因子)")
+
+# ↑ 在 LSTM 的 permutation importance 输出之后添加 ↓
+
+up_top5   = up_result_lstm["importance_series"].head(5).index.tolist()
+down_top5 = down_result_lstm["importance_series"].head(5).index.tolist()
+
+print("UP Top5 features:", up_top5)
+print("DOWN Top5 features:", down_top5)
+
+# =========================
+# 20. 确定因子方向
+# =========================
+
+def infer_factor_sign(df, factor, future_col="future_ret_H", n_group=5):
+    """
+    用分位数分层确定因子方向：
+    Q5 > Q1 → 正向 (+1)
+    Q5 < Q1 → 反向 (-1)
+    """
+    sub = df[[factor, future_col]].dropna().copy()
+    if len(sub) < 200:
+        return 0  # 数据太少
+
+    # 分层
+    sub["group"] = pd.qcut(sub[factor], n_group, labels=False, duplicates="drop")
+    g = sub.groupby("group")[future_col].mean()
+
+    if g.iloc[-1] > g.iloc[0]: 
+        return +1
+    elif g.iloc[-1] < g.iloc[0]:
+        return -1
+    else:
+        return 0
+
+all_factors = list(set(up_result_lstm["top_features"] + 
+                       down_result_lstm["top_features"]))
+
+sign_dict = {}
+
+for f in all_factors:
+    s = infer_factor_sign(train_all, f, "future_ret_H", n_group=5)
+    sign_dict[f] = s
+
+
+print("\n因子方向 sign_dict：")
+print(sign_dict)
+
+# =========================
+# 21. 因子组合score
+# =========================
+
+def add_score(df, factor_list, sign_dict, lookback=200):
+    df = df.copy()
+    for f in factor_list:
+        df[f"_z_{f}"] = (df[f] - df[f].rolling(lookback).mean()) / df[f].rolling(lookback).std()
+
+    z_cols = [f"_z_{f}" for f in factor_list]
+
+    df["score"] = 0
+    for f in factor_list:
+        df["score"] += sign_dict[f] * df[f"_z_{f}"]
+
+    # 平滑
+    df["score"] = df["score"].rolling(3).mean()
+    return df
+
+# =========================
+# 21. 简易CTA 策略
+# =========================
+def cta_backtest_money(
+    df,
+    score_col="score",
+    T=1.0,
+    base_th=0.01,       # 1%
+    max_hold_days=10,    # 最多持有 3 日
+    init_capital=500000,  # 初始资金 50w
+    pos_pct=0.3        # 每次用 10% 仓位
+):
+    """
+    高级 CTA 回测（真实资金版）：
+    - 初始资金：init_capital
+    - 仓位：每次用账户净值的 10% 建仓
+    - 时间止损 + 强止盈 + 止损 + 回撤止盈 + 持仓忽略信号
+    """
+
+    df = df.copy()
+    df["ret"] = df["close"].pct_change().fillna(0)
+
+    # ===== 1) 生成基础信号 =====
+    df["signal_raw"] = 0
+    df.loc[df[score_col] >  T, "signal_raw"] =  3
+    df.loc[df[score_col] < -T, "signal_raw"] = -3
+
+    # ===== 初始化策略状态 =====
+    capital = init_capital       # 账户净值
+    pos = 0                      # 当前方向（+1 / -1）
+    hold_value = 0               # 持仓金额（真实资金）
+    cum_ret = 0.0
+    hold_days = 0
+    reached_tp1 = False
+
+    capital_list = []
+    pos_list = []
+    hold_value_list = []
+
+    for i in range(len(df)):
+        daily_ret_raw = df["ret"].iloc[i]
+        signal_today = df["signal_raw"].iloc[i]
+
+        # ===== A. 空仓 → 是否开仓？ =====
+        if pos == 0 and signal_today != 0:
+            pos = signal_today
+            hold_value = capital * pos_pct       # 账户净值的10%
+            cum_ret = 0.0
+            hold_days = 0
+            reached_tp1 = False
+
+        # ===== B. 当日收益（真实资金） =====
+        daily_profit = pos * hold_value * daily_ret_raw
+
+        # 更新账户净值
+        capital += daily_profit
+
+        # ===== C. 如果持仓，更新指标 =====
+        if pos != 0:
+            cum_ret += pos * daily_ret_raw
+            hold_days += 1
+
+            if cum_ret >= base_th:
+                reached_tp1 = True
+
+            # ===== D. 判断是否退出 =====
+            exit_flag = False
+            if cum_ret >= 2.5 * base_th:            # 强止盈
+                exit_flag = True
+            elif cum_ret <= -0.8 * base_th:         # 止损
+                exit_flag = True
+            elif reached_tp1 and cum_ret <= 0.55*base_th:  # 回撤止盈
+                exit_flag = True
+            elif hold_days >= max_hold_days:        # 时间止损
+                exit_flag = True
+
+            if exit_flag:
+                pos = 0
+                hold_value = 0
+                cum_ret = 0.0
+                hold_days = 0
+                reached_tp1 = False
+
+        # ===== 记录状态 =====
+        capital_list.append(capital)
+        pos_list.append(pos)
+        hold_value_list.append(hold_value)
+
+    df["capital"] = capital_list
+    df["pos"] = pos_list
+    df["hold_value"] = hold_value_list
+    df["equity"] = df["capital"] / init_capital  # 归一化净值曲线
+
+    return df
+
+# =========================
+# 22. 简易回测
+# =========================
+
+#########################################
+# 1) 加载玻璃、豆粕主连
+#########################################
+df_fg = load_main_daily("FG0")
+df_m  = load_main_daily("M0")
+
+#########################################
+# 2) 构建日频特征
+#########################################
+df_fg_f = build_daily_features(df_fg)
+df_m_f  = build_daily_features(df_m)
+
+#########################################
+# 3) 统一因子列表（来自 LSTM）
+#########################################
+factor_list = list(set(up_top5 + down_top5))
+
+
+#########################################
+# 4) 推断因子方向（基于 RB 训练集）
+#########################################
+sign_dict = {}
+for f in factor_list:
+    sign_dict[f] = infer_factor_sign(train_all, f, future_col="future_ret_H")
+
+print("sign_dict =", sign_dict)
+
+#########################################
+# 5) 为 FG/M 添加 CTA 评分
+#########################################
+factor_list_fg = [f for f in factor_list if f in df_fg_f.columns]
+factor_list_m  = [f for f in factor_list if f in df_m_f.columns]
+
+df_fg_s = add_score(df_fg_f, factor_list_fg, sign_dict)
+df_m_s  = add_score(df_m_f, factor_list_m, sign_dict)
+
+#########################################
+# 6) CTA 回测（真实资金）
+#########################################
+bt_fg = cta_backtest_money(df_fg_s, score_col="score",
+                           init_capital=500000, pos_pct=0.15)
+
+bt_m  = cta_backtest_money(df_m_s,  score_col="score",
+                           init_capital=500000, pos_pct=0.15)
+
+#########################################
+# 7) 绘制净值
+#########################################
+bt_fg["equity"].plot(figsize=(12,4), title="FG0 CTA Equity")
+bt_m["equity"].plot(figsize=(12,4), title="M0 CTA Equity")
+
 
