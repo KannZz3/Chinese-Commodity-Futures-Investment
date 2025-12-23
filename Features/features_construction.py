@@ -136,7 +136,7 @@ def build_price_features(
         )
 
     # =========================
-    # 3. Volume & open-interest factors
+    # 3. Volume factors
     # =========================
 
     # 1. Volume returns: 计算成交量的日收益率
@@ -173,7 +173,7 @@ def build_price_features(
     data["vol_price_div_5"] = data["volume"].pct_change(5) - data["close"].pct_change(5)
 
     # =========================
-    # 4. Hold (open interest) features
+    # 4. Hold (open interest) factors
     # =========================
 
     # 1. Hold returns: 计算持仓量的日收益率
