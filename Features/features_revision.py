@@ -184,18 +184,18 @@ def fill_missing_values(data: pd.DataFrame):
     return data.iloc[max_leading:].copy()
 
 
-# =========================
+# =============================
 # 3. 因子预处理
-# =========================
+# =============================
 class FeaturePreprocessor:
     def __init__(
         self,
-        heavy_kurtosis=6,
-        clip_pct=(0.1, 99.9),
-        log_candidates=("volume", "hold"),
-        sigma_clip=6,
-        robust=False,
-        check_finite=True,
+        heavy_kurtosis=6,              # 重尾判定的峰度阈值（kurtosis > heavy_kurtosis）
+        clip_pct=(0.1, 99.9),          # 重尾列的分位数裁剪区间
+        log_candidates=("volume", "hold"),  # 强制按重尾处理的候选列
+        sigma_clip=6,                 # 全因子 σ 裁剪倍数（均值±sigma_clip*std）
+        robust=False,                 # True 用 RobustScaler，否则 StandardScaler
+        check_finite=True,            # True 则强制检查 NaN/inf
     ):
         self.heavy_kurtosis = heavy_kurtosis
         self.clip_low, self.clip_high = clip_pct
@@ -204,20 +204,17 @@ class FeaturePreprocessor:
         self.use_robust = robust
         self.check_finite = check_finite
 
-        self.feature_cols = None
-        self.heavy_cols = []
+        self.feature_cols = None      # 因子列名列表
+        self.heavy_cols = []          # 重尾列名列表
 
-        # heavy cols percentile bounds: {col: (lo, hi)}
-        self.clip_bounds = {}
+        self.clip_bounds = {}         # 重尾列分位数边界：{col: (lo, hi)}
+        self.sigma_bounds = {}        # σ裁剪统计：{col: (mean, std)}
 
-        # sigma-clip bounds for cols: {col: (mean, std)}
-        self.sigma_bounds = {}
-
-        self.scaler = None
-        self.is_fitted = False
+        self.scaler = None            # 标准化器（fit 在 train 上）
+        self.is_fitted = False        # 是否已 fit
 
     # ============================
-    # utils
+    # 工具：检查 NaN/inf
     # ============================
     def _check_no_nan_inf(self, X: pd.DataFrame, where: str):
         if not self.check_finite:
@@ -234,12 +231,12 @@ class FeaturePreprocessor:
         v = X.iloc[i, j]
 
         raise ValueError(
-            f"[{where}] found non-finite value at index={idx}, col='{col}', value={v}. "
-            "This preprocessor does NOT handle NaN/inf; please clean data before calling."
+            f"[{where}] 发现非有限值（NaN/inf）：index={idx}, col='{col}', value={v}. "
+            "本预处理器不负责处理 NaN/inf，请先在外部清洗。"
         )
 
     # ============================
-    # 1) detect heavy-tail columns
+    # 1) 自动检测重尾列
     # ============================
     def _detect_heavy(self, X: pd.DataFrame):
         heavy = []
@@ -253,13 +250,13 @@ class FeaturePreprocessor:
                 if np.isfinite(k) and (k > self.heavy_kurtosis):
                     heavy.append(c)
             except Exception:
-                # 保守：检测失败就不自动归为 heavy
+                # 检测失败则不纳入 heavy
                 pass
 
         return heavy
 
     # ============================
-    # 2) signed-log with percentile clip (NO NaN handling)
+    # 2) 重尾处理：分位数裁剪 + signed-log
     # ============================
     def _signed_log_clip(self, x: np.ndarray, col: str, fit: bool):
         x = np.asarray(x, dtype=float)
@@ -267,7 +264,7 @@ class FeaturePreprocessor:
         if fit:
             lo, hi = np.percentile(x, [self.clip_low, self.clip_high])
 
-            # 常数列/异常列兜底：避免 lo>=hi
+            # 常数/异常列兜底：避免 lo>=hi
             if (not np.isfinite(lo)) or (not np.isfinite(hi)) or (lo >= hi):
                 m = float(np.mean(x))
                 eps = 1e-12
@@ -281,7 +278,7 @@ class FeaturePreprocessor:
         return np.sign(x) * np.log1p(np.abs(x))
 
     # ============================
-    # 3) sigma-clip for ALL columns (NO NaN handling)
+    # 3) σ裁剪：均值±k*std（所有列）
     # ============================
     def _sigma_clip(self, x: np.ndarray, col: str, fit: bool):
         x = np.asarray(x, dtype=float)
@@ -298,30 +295,30 @@ class FeaturePreprocessor:
         return np.clip(x, lo, hi)
 
     # ============================
-    # 4) fit(train)
+    # 4) 训练期拟合：只用 train 学参数
     # ============================
     def fit(self, df: pd.DataFrame, feature_cols):
         """
-        假设 df[feature_cols] 已经在外部处理完 NaN/inf，这里只做：
-        1) heavy: percentile clip + signed-log（训练期学边界）
-        2) all features: 均值±sigma_clip*std 的 σ-clip（训练期学 m, sd）
-        3) scaler fit（训练期）
+        前提：df[feature_cols] 已在外部清洗完 NaN/inf。
+        流程：
+        1) 识别 heavy 列（自动 + 手动）
+        2) heavy：分位数裁剪 + signed-log（记录 clip_bounds）
+        3) 全列：σ裁剪（记录 mean/std）
+        4) 标准化器 fit（仅 train）
         """
-        assert df.index.is_monotonic_increasing, "df must be sorted in ascending time order"
-        assert df.index.is_unique, "df index must be unique"
-        assert isinstance(df.index, pd.DatetimeIndex), "df.index must be a DatetimeIndex"
+        assert df.index.is_monotonic_increasing, "索引必须按时间升序"
+        assert df.index.is_unique, "索引必须唯一"
+        assert isinstance(df.index, pd.DatetimeIndex), "索引必须是 DatetimeIndex"
 
         self.feature_cols = list(feature_cols)
         X = df[self.feature_cols].copy()
 
         self._check_no_nan_inf(X, where="fit")
 
-        # ===== heavy cols: auto + manual =====
         auto_heavy = self._detect_heavy(X)
         manual_heavy = [c for c in self.log_candidates if c in self.feature_cols]
         self.heavy_cols = sorted(set(auto_heavy + manual_heavy))
 
-        # ===== apply transforms on TRAIN to learn bounds =====
         Xp = X.copy()
 
         for col in self.heavy_cols:
@@ -337,15 +334,15 @@ class FeaturePreprocessor:
         return self
 
     # ============================
-    # 5) transform(test/val)
+    # 5) 预测期变换：只用 train 参数做映射
     # ============================
     def transform(self, df: pd.DataFrame):
         if not self.is_fitted:
-            raise RuntimeError("Call fit(train) before transform(test).")
-        
-        assert df.index.is_monotonic_increasing, "df must be sorted in ascending time order"
-        assert df.index.is_unique, "df index must be unique"
-        assert isinstance(df.index, pd.DatetimeIndex), "df.index must be a DatetimeIndex"
+            raise RuntimeError("请先 fit(train)，再 transform(test/val)。")
+
+        assert df.index.is_monotonic_increasing, "索引必须按时间升序"
+        assert df.index.is_unique, "索引必须唯一"
+        assert isinstance(df.index, pd.DatetimeIndex), "索引必须是 DatetimeIndex"
 
         X = df[self.feature_cols].copy()
         self._check_no_nan_inf(X, where="transform")
@@ -364,9 +361,13 @@ class FeaturePreprocessor:
         out[self.feature_cols] = Z
         return out
 
+    # ============================
+    # 简单统计报告
+    # ============================
     def report(self, df: pd.DataFrame):
         X = df[self.feature_cols]
         stats = X.describe().T
         print(stats[["mean", "std", "min", "max"]])
         print("\nMax abs:", X.abs().to_numpy().max())
+
 
