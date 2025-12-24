@@ -55,7 +55,6 @@ def check_missing_values(data: pd.DataFrame):
 # ===============================
 # 2. 缺失值处理
 # ===============================
-
 def fill_missing_values(data: pd.DataFrame):
     data = data.copy()
 
@@ -102,8 +101,14 @@ def fill_missing_values(data: pd.DataFrame):
             print(f"Before filling {c}, NaN count: {data[c].isna().sum()}")
             data[c] = data[c].fillna(method="ffill") 
             print(f"After filling {c}, NaN count: {data[c].isna().sum()}")
+    first_pos = []
+    for c in data.columns:
+        m = data[c].notna().to_numpy()
+        if m.any():                      # 该列至少有一个有效值
+            first_pos.append(int(m.argmax()))  # 首个有效值位置 = leading NaN 行数
+    max_leading = max(first_pos) if first_pos else 0
 
-    return data
+    return data.iloc[max_leading:].copy()
 
 
 # =========================
