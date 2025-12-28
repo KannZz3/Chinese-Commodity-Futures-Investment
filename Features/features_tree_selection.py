@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score, log_loss, classification_report
+
 __all__ = ["train_one_direction_xgb"]
 
 
@@ -451,10 +452,5 @@ def train_one_direction_xgb(
     return result
 
 
-# TODO（后续扩展建议）：
-# - 你加入 RF / LightGBM 时，可以复用：
-#   1) windows 构造逻辑
-#   2) OOS permutation importance 框架（baseline - permuted_score）
-#   3) 单因子复核框架（把单因子模型换成 RF/LGB/XGB）
-# - 若用于严格回测：建议新增 oof_prob（walk-forward 仅填 valid 段预测），避免 look-ahead。
+
 
